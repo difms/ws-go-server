@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/gorilla/websocket"
@@ -33,8 +34,14 @@ var clients = make(map[string]*websocket.Conn) // Карта userID -> соед�
 
 var nodeId = 1
 var redisHost = "localhost:6379"
+var userAuthURL = "http://127.0.0.1:8000/api/getUser"
+var userAuthURLmethod = "GET"
 var serverPort = ":8080"
 var wsURL = "/ws"
+var useSSL = false // true для использования SSL
+
+var deleteCacheMessages = false  // true чтобы удалять неотправленные сообщения через deleteCacheMessagesTime время
+var deleteCacheMessagesTime = 24 // в часах
 
 // User представляет пользователя
 type User struct {
@@ -51,7 +58,7 @@ type Notification struct {
 // AuthenticateWithSanctum проверяет токен и получает информацию о пользователе
 func AuthenticateWithSanctum(token string) (*User, error) {
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", "http://127.0.0.1:8000/api/getUser", nil) // Укажите правильный URL вашего API
+	req, err := http.NewRequest(userAuthURLmethod, userAuthURL, nil) // Укажите правильный URL вашего API
 	if err != nil {
 		return nil, err
 	}
@@ -260,6 +267,17 @@ func subscribeToRedis() {
 				} else {
 					log.Printf("Message saved to Redis for user %s", userID)
 				}
+
+				// Проверяем, нужно ли устанавливать время жизни для списка
+				if deleteCacheMessages {
+					// Преобразуем время из часов в секунды
+					expirationTime := time.Duration(deleteCacheMessagesTime) * time.Hour
+
+					err = redisClient.Expire(fmt.Sprintf("pending_messages:%s", userID), expirationTime).Err()
+					if err != nil {
+						log.Println("Failed to set expiration for pending messages:", err)
+					}
+				}
 			}
 
 			// Если мессадж является публичным
@@ -293,4 +311,12 @@ func main() {
 	http.HandleFunc(wsURL, jwtMiddleware(handleWebSocket))
 	log.Println("WS Server started on port:", serverPort)
 	log.Fatal(http.ListenAndServe(serverPort, nil))
+
+	if useSSL {
+		// Запуск HTTPS сервера
+		log.Fatal(http.ListenAndServeTLS(serverPort, "server.crt", "server.key", http.HandlerFunc(jwtMiddleware(handleWebSocket))))
+	} else {
+		// Запуск обычного HTTP сервера
+		log.Fatal(http.ListenAndServe(serverPort, http.HandlerFunc(jwtMiddleware(handleWebSocket))))
+	}
 }
