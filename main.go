@@ -31,6 +31,11 @@ var upgrader = websocket.Upgrader{
 
 var clients = make(map[string]*websocket.Conn) // Карта userID -> соединение WebSocket
 
+var nodeId = 1
+var redisHost = "localhost:6379"
+var serverPort = ":8080"
+var wsURL = "/ws"
+
 // User представляет пользователя
 type User struct {
 	ID    uint   `json:"id"`
@@ -38,12 +43,9 @@ type User struct {
 }
 
 type Notification struct {
-	UserID uint `json:"user_id"`
-	Data   struct {
-		Event   string `json:"event"`
-		Message string `json:"message"`
-	} `json:"data"`
-	Channel string `json:"channel"`
+	UserID  int                    `json:"user_id"`
+	Data    map[string]interface{} `json:"data"` // или структура для Data
+	Channel string                 `json:"channel"`
 }
 
 // AuthenticateWithSanctum проверяет токен и получает информацию о пользователе
@@ -138,10 +140,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clients[userID] = conn // Добавляем клиента
-	log.Println("clients", clients)
 
 	// Сохраняем информацию о подключении в Redis
-	err = redisClient.Set(fmt.Sprintf("user:%s:node", userID), "nodeID", 0).Err()
+	err = redisClient.Set(fmt.Sprintf("user:%s:node", userID), nodeId, 0).Err()
 	if err != nil {
 		log.Println("Failed to save to Redis:", err)
 		return
@@ -153,19 +154,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		redisClient.Del(fmt.Sprintf("user:%s:node", userID)) // Удаляем запись при отключении
 	}()
 
-	// // Проверяем неподтвержденные сообщения для пользователя
-	// pendingMessages, _ := redisClient.LRange(fmt.Sprintf("pending_messages:%s", userID), 0, -1).Result()
-	// for _, message := range pendingMessages {
-	// 	err := conn.WriteMessage(websocket.TextMessage, []byte(message))
-	// 	log.Printf("Sending message to user %s: %s", userID, message)
-	// 	if err != nil {
-	// 		log.Printf("Failed to send message to user %s: %v", userID, err)
-	// 	}
-	// }
-
-	// // Чистим сообщения после отправки
-	// redisClient.Del(fmt.Sprintf("pending_messages:%s", userID))
-
 	// Проверяем неподтвержденные сообщения для пользователя
 	pendingMessages, err := redisClient.LRange(fmt.Sprintf("pending_messages:%s", userID), 0, -1).Result()
 	if err != nil {
@@ -174,7 +162,31 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, message := range pendingMessages {
-		err := conn.WriteMessage(websocket.TextMessage, []byte(message))
+		// Отправляем сообщение как есть, не изменяя его структуры
+		// err := conn.WriteMessage(websocket.TextMessage, []byte(message))
+
+		// Отправляем сообщение как Notification
+		var notification Notification
+
+		// Преобразуем JSON-строку `message` в структуру `Notification`
+		if err := json.Unmarshal([]byte(message), &notification); err != nil {
+			log.Printf("Failed to unmarshal message: %v", err)
+			return
+		}
+
+		// Cериализуем всю структуру, а не только `Data`
+		messageJSON, err := json.Marshal(notification)
+		if err != nil {
+			log.Printf("Failed to marshal notification: %v", err)
+			return
+		}
+
+		// Отправка клиенту
+		err = conn.WriteMessage(websocket.TextMessage, messageJSON)
+		if err != nil {
+			log.Printf("Failed to send message to user: %v", err)
+		}
+
 		if err != nil {
 			log.Printf("Failed to send message to user %s: %v", userID, err)
 		} else {
@@ -182,7 +194,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Чистим сообщения после отправки
+	// Чистим сообщения в redis после отправки клиенту
 	redisClient.Del(fmt.Sprintf("pending_messages:%s", userID))
 
 	for {
@@ -205,52 +217,60 @@ func subscribeToRedis() {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(msg.Payload), &data)
 
+		var notification Notification
+
+		// Преобразуем JSON-строку `message` в структуру `Notification`
+		if err := json.Unmarshal([]byte(msg.Payload), &notification); err != nil {
+			log.Printf("Failed to unmarshal message: %v", err)
+			return
+		}
+
+		// Убедитесь, что вы сериализуете всю структуру, а не только `Data`
+		messageJSON, err := json.Marshal(notification)
+		if err != nil {
+			log.Printf("Failed to marshal notification: %v", err)
+			return
+		}
+
+		// Если мессадж является приватным, для конкретного юзера
 		if msg.Channel == "private-channel" {
 			userID := fmt.Sprintf("%v", data["user_id"])
 			//message := fmt.Sprintf("%v", data["message"])
 
 			// Проверяем, подключен ли пользователь к этой ноде
 			if conn, ok := clients[userID]; ok {
-				// Отправляем приватное сообщение пользователю
-				err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)) // Отправляем JSON-формат
+				// Отправляем приватное сообщение пользователю как есть
+				//err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)) // Отправляем JSON-формат
+
+				// Отправляем приватное сообщение пользователю как преобразованное в Notification
+				err = conn.WriteMessage(websocket.TextMessage, messageJSON)
 				if err != nil {
 					log.Printf("Failed to send message to user %s: %v", userID, err)
 				} else {
 					log.Printf("Приватное сообщение отправлено пользователю %s", userID)
 				}
 			} else {
-				log.Printf("User %s is not connected. Saving message to Redis.", userID)
+				log.Printf("User id: %s - Client is not connected. Saving message to Redis.", userID)
 
-				// Здесь вы можете сохранить сообщение в виде байтов
+				// Если клиент не подключен - сохраняем сообщения для него в redis для дальнейшей отправки в исходном формате
 				err := redisClient.LPush(fmt.Sprintf("pending_messages:%s", userID), msg.Payload).Err()
+				log.Printf("Message saved to Redis for user: %s", msg.Payload)
 				if err != nil {
 					log.Printf("Failed to save message to Redis: %v", err)
 				} else {
 					log.Printf("Message saved to Redis for user %s", userID)
 				}
-				// // Пользователь не подключен, сохраняем сообщение в Redis
-				// messageData := map[string]interface{}{
-				// 	"user_id": userID,
-				// 	"message": message,
-				// }
-
-				// log.Printf("Save md: ", messageData)
-
-				// // Сериализация сообщения в JSON
-				// messageJSON, err := json.Marshal(messageData)
-				// if err != nil {
-				// 	log.Printf("Failed to marshal message: %v", err)
-				// 	continue
-				// }
-
-				// log.Printf("Save md json: ", messageJSON)
-
-				// redisClient.LPush(fmt.Sprintf("pending_messages:%s", userID), messageJSON)
 			}
+
+			// Если мессадж является публичным
 		} else if msg.Channel == "public-channel" {
 			// // Отправляем публичное сообщение всем подключённым клиентам
 			for _, conn := range clients {
-				err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)) // Отправляем JSON-формат
+				// Отправляем приватное сообщение пользователю как есть
+				//err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)) // Отправляем JSON-формат
+
+				// Отправляем приватное сообщение пользователю как преобразованное в Notification
+				err = conn.WriteMessage(websocket.TextMessage, messageJSON)
 				if err != nil {
 					log.Printf("Failed to send public message: %v", err)
 				}
@@ -263,14 +283,14 @@ func subscribeToRedis() {
 func main() {
 	// Инициализация клиента Redis
 	redisClient = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: redisHost,
 	})
 
 	// Запуск подписки на канал Redis в отдельной горутине
 	go subscribeToRedis()
 
 	// Запуск HTTP сервера для WebSocket
-	http.HandleFunc("/ws", jwtMiddleware(handleWebSocket))
-	log.Println("WS Server started!")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.HandleFunc(wsURL, jwtMiddleware(handleWebSocket))
+	log.Println("WS Server started on port:", serverPort)
+	log.Fatal(http.ListenAndServe(serverPort, nil))
 }
