@@ -24,12 +24,12 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-var clients = make(map[string]*websocket.Conn)      // Карта userID -> соединение WebSocket
-var userChannels = make(map[string]map[string]bool) // Карта userID -> map[channelName]bool
-
 const (
 	PORT string = ":8080"
 )
+
+var clients = make(map[string]*websocket.Conn)      // Карта userID -> соединение WebSocket
+var userChannels = make(map[string]map[string]bool) // Карта userID -> map[channelName]bool
 
 var nodeId = 1
 var redisHost = "localhost:6379"
@@ -66,6 +66,12 @@ type Notification struct {
 	UserID  int                    `json:"user_id"`
 	Data    map[string]interface{} `json:"data"` // или структура для Data
 	Channel string                 `json:"channel"`
+}
+
+type UserAction struct {
+	UserID  string `json:"user_id"`
+	Action  string `json:"action"`
+	Channel string `json:"channel"`
 }
 
 // addPresence добавляет пользователя в presence канал
@@ -269,6 +275,28 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				addPresence(channelName, userID)
 				log.Printf("User %s subscribed to channel %s", userID, channelName)
 			}
+		case "action":
+			// Обработка действий пользователя
+			action, ok := request["action"].(string)
+			if !ok {
+				log.Println("Invalid action format. Expected a string.")
+				continue
+			}
+
+			channel, ok := request["channel"].(string)
+			if !ok {
+				log.Println("Invalid channel format. Expected a string.")
+				continue
+			}
+
+			userAction := UserAction{
+				UserID:  userID,
+				Action:  action,
+				Channel: channel,
+			}
+
+			// Отправляем действие пользователя в Redis
+			publishUserAction(userAction)
 
 		default:
 			log.Println("Unknown message type:", request["type"])
@@ -283,32 +311,72 @@ func subscribeToRedis() {
 	ch := pubsub.Channel()
 
 	for msg := range ch {
-		var notification Notification
-		if err := json.Unmarshal([]byte(msg.Payload), &notification); err != nil {
-			log.Printf("Failed to unmarshal message: %v", err)
-			continue
-		}
+		// ... (код обработки сообщений такой же)
 
-		messageJSON, err := json.Marshal(notification)
-		if err != nil {
-			log.Printf("Failed to marshal notification: %v", err)
-			continue
-		}
-
-		if event, ok := notification.Data["event"]; ok {
-			switch event {
-			case "user_joined":
-				log.Printf("User %s joined channel %s", notification.Data["user_id"], msg.Channel)
-			case "user_left":
-				log.Printf("User %s left channel %s", notification.Data["user_id"], msg.Channel)
-			}
-		}
-
-		// Обработка публичных сообщений
-		if strings.HasPrefix(msg.Channel, publicChannelPrefix) {
-			// Отправляем публичное сообщение всем подключенным клиентам
+		// Обработка действий пользователя
+		var userAction UserAction
+		if err := json.Unmarshal([]byte(msg.Payload), &userAction); err == nil {
+			// Отправляем действие пользователя подключенным клиентам
 			for userID, channels := range userChannels {
 				if _, subscribed := channels[msg.Channel]; subscribed {
+					if conn, ok := clients[userID]; ok {
+						// Проверяем, не отправляем ли мы действие пользователю, который его инициировал
+						if userID != userAction.UserID {
+							err = conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload))
+							if err != nil {
+								log.Printf("Failed to send user action to user %s: %v", userID, err)
+							} else {
+								log.Printf("User action sent to user %s on channel %s", userID, msg.Channel)
+							}
+						}
+					}
+				}
+			}
+		} else {
+			var notification Notification
+			if err := json.Unmarshal([]byte(msg.Payload), &notification); err != nil {
+				log.Printf("Failed to unmarshal message: %v", err)
+				continue
+			}
+
+			messageJSON, err := json.Marshal(notification)
+			if err != nil {
+				log.Printf("Failed to marshal notification: %v", err)
+				continue
+			}
+
+			if event, ok := notification.Data["event"]; ok {
+				switch event {
+				case "user_joined":
+					log.Printf("User %s joined channel %s", notification.Data["user_id"], msg.Channel)
+				case "user_left":
+					log.Printf("User %s left channel %s", notification.Data["user_id"], msg.Channel)
+				}
+			}
+
+			// Обработка публичных сообщений
+			if strings.HasPrefix(msg.Channel, publicChannelPrefix) {
+				// Отправляем публичное сообщение всем подключенным клиентам
+				for userID, channels := range userChannels {
+					if _, subscribed := channels[msg.Channel]; subscribed {
+						if conn, ok := clients[userID]; ok {
+							err = conn.WriteMessage(websocket.TextMessage, messageJSON)
+							if err != nil {
+								log.Printf("Failed to send message to user %s: %v", userID, err)
+							} else {
+								log.Printf("Message sent to user %s on channel %s", userID, msg.Channel)
+							}
+						}
+					}
+				}
+				// Обработка приватных сообщений
+			} else if strings.HasPrefix(msg.Channel, privateChannelPrefix) {
+				// Извлекаем ID пользователя из имени канала
+				parts := strings.Split(msg.Channel, "_")
+				if len(parts) > 2 { // Проверяем, что частей достаточно
+					userID := parts[2] // ID пользователя - третья часть имени канала
+
+					// Отправляем сообщение, если пользователь онлайн
 					if conn, ok := clients[userID]; ok {
 						err = conn.WriteMessage(websocket.TextMessage, messageJSON)
 						if err != nil {
@@ -316,46 +384,41 @@ func subscribeToRedis() {
 						} else {
 							log.Printf("Message sent to user %s on channel %s", userID, msg.Channel)
 						}
-					}
-				}
-			}
-			// Обработка приватных сообщений
-		} else if strings.HasPrefix(msg.Channel, privateChannelPrefix) {
-			// Извлекаем ID пользователя из имени канала
-			parts := strings.Split(msg.Channel, "_")
-			if len(parts) > 2 { // Проверяем, что частей достаточно
-				userID := parts[2] // ID пользователя - третья часть имени канала
-
-				// Отправляем сообщение, если пользователь онлайн
-				if conn, ok := clients[userID]; ok {
-					err = conn.WriteMessage(websocket.TextMessage, messageJSON)
-					if err != nil {
-						log.Printf("Failed to send message to user %s: %v", userID, err)
 					} else {
-						log.Printf("Message sent to user %s on channel %s", userID, msg.Channel)
-					}
-				} else {
-					// Сохраняем сообщение в Redis, если пользователь оффлайн
-					log.Printf("User %s is offline. Saving message to Redis.", userID)
-					err := redisPool.LPush(fmt.Sprintf("pending_messages:%s", userID), messageJSON).Err()
-					if err != nil {
-						log.Printf("Failed to save message to Redis: %v", err)
-					} else {
-						log.Printf("Message saved to Redis for user %s", userID)
-					}
-
-					// Устанавливаем время жизни для списка непрочитанных сообщений, если включена функция `deleteCacheMessages`
-					if deleteCacheMessages {
-						expirationTime := time.Duration(deleteCacheMessagesTime) * time.Hour
-						err = redisPool.Expire(fmt.Sprintf("pending_messages:%s", userID), expirationTime).Err()
+						// Сохраняем сообщение в Redis, если пользователь оффлайн
+						log.Printf("User %s is offline. Saving message to Redis.", userID)
+						err := redisPool.LPush(fmt.Sprintf("pending_messages:%s", userID), messageJSON).Err()
 						if err != nil {
-							log.Println("Failed to set expiration for pending messages:", err)
+							log.Printf("Failed to save message to Redis: %v", err)
+						} else {
+							log.Printf("Message saved to Redis for user %s", userID)
+						}
+
+						// Устанавливаем время жизни для списка непрочитанных сообщений, если включена функция `deleteCacheMessages`
+						if deleteCacheMessages {
+							expirationTime := time.Duration(deleteCacheMessagesTime) * time.Hour
+							err = redisPool.Expire(fmt.Sprintf("pending_messages:%s", userID), expirationTime).Err()
+							if err != nil {
+								log.Println("Failed to set expiration for pending messages:", err)
+							}
 						}
 					}
 				}
 			}
 		}
 	}
+}
+
+// Функция для публикации действий пользователя в Redis
+func publishUserAction(action UserAction) {
+	actionJSON, err := json.Marshal(action)
+	if err != nil {
+		log.Printf("Failed to marshal user action: %v", err)
+		return
+	}
+
+	// Публикуем действие в канал, соответствующий каналу чата
+	redisPool.Publish(action.Channel, actionJSON)
 }
 
 func getChannelPresenceHandler(w http.ResponseWriter, r *http.Request) {

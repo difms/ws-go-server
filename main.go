@@ -32,6 +32,10 @@ var upgrader = websocket.Upgrader{
 
 var clients = make(map[string]*websocket.Conn) // Карта userID -> соединение WebSocket
 
+const (
+	PORT string = ":8080"
+)
+
 var nodeId = 1
 var redisHost = "localhost:6379"
 var userAuthURL = "http://127.0.0.1:8000/api/getUser"
